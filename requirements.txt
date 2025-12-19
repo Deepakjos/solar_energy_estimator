@@ -1,0 +1,9 @@
+streamlit
+requests
+pandas
+geopy
+plotly
+folium
+streamlit-folium
+shapely
+pyproj
