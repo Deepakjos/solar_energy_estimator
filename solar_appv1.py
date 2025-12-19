@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 import plotly.express as px
 import folium
 from streamlit_folium import st_folium
@@ -23,17 +24,33 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# Ensure sidebar stays on top in some deployments (Streamlit Cloud)
+st.markdown("""
+<style>
+[data-testid="stSidebar"] { position: relative; z-index: 2000; }
+.leaflet-container, iframe { z-index: 1000; }
+</style>
+""", unsafe_allow_html=True)
+
 # --- CACHED LOGIC ---
-@st.cache_data
 def get_coordinates(address):
     try:
-        geolocator = Nominatim(user_agent="solar_assessment_pro")
-        location = geolocator.geocode(address)
-        return (location.latitude, location.longitude, location.address) if location else (None, None, None)
-    except:
+        # Identify the client to Nominatim (replace placeholder@example.com later if needed)
+        geolocator = Nominatim(user_agent="solar_assessment_pro (placeholder@example.com)")
+        geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+        location = geocode(address)
+        if not location:
+            return None, None, None
+        return location.latitude, location.longitude, location.address
+    except Exception as e:
+        # Surface geocoding errors in the app UI/logs on Streamlit Cloud
+        try:
+            st.error(f"Geocoding error: {e}")
+        except Exception:
+            pass
         return None, None, None
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def fetch_archive_data(lat, lon, start_date, end_date):
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
@@ -41,8 +58,21 @@ def fetch_archive_data(lat, lon, start_date, end_date):
         "start_date": start_date, "end_date": end_date,
         "hourly": "shortwave_radiation", "timezone": "auto"
     }
-    res = requests.get(url, params=params)
-    return res.json() if res.status_code == 200 else None
+    try:
+        res = requests.get(url, params=params, timeout=20)
+        res.raise_for_status()
+        j = res.json()
+        if 'hourly' not in j or 'shortwave_radiation' not in j.get('hourly', {}):
+            # Return snippet for debugging
+            return None, res.status_code, res.text[:500]
+        return j, res.status_code, None
+    except Exception as e:
+        # Try to return any available response snippet for debugging
+        try:
+            return None, getattr(res, 'status_code', None), getattr(res, 'text', str(e))[:500]
+        except Exception:
+            return None, None, str(e)[:500]
+
 
 def calculate_geodesic_area(geojson_geometry):
     """Calculate the geodesic area of a GeoJSON geometry in square meters."""
@@ -61,13 +91,31 @@ st.sidebar.header("🔌 System Capacity")
 sys_capacity = st.sidebar.slider("Proposed System Size (kW)", 1.0, 50.0, 5.0)
 sys_efficiency = st.sidebar.slider("System Efficiency (%)", 50, 95, 78) / 100
 
+# Debug and manual inputs to help Streamlit Cloud troubleshooting
+debug = st.sidebar.checkbox("DEBUG mode", False)
+use_manual = st.sidebar.checkbox("Enter lat/lon manually", False)
+manual_lat = None
+manual_lon = None
+if use_manual:
+    manual_lat = st.sidebar.number_input("Latitude", value=18.5204, format="%.6f")
+    manual_lon = st.sidebar.number_input("Longitude", value=73.8567, format="%.6f")
+
 # --- MAIN PAGE ---
 st.title("☀️ Solar Rooftop Self-Assessment")
 st.write("Determine your solar potential, savings, and environmental contribution in seconds.")
 
-if address_input:
-    lat, lon, full_address = get_coordinates(address_input)
-    
+if address_input or use_manual:
+    if use_manual:
+        lat = manual_lat
+        lon = manual_lon
+        full_address = f"Manual: {lat}, {lon}"
+    else:
+        lat, lon, full_address = get_coordinates(address_input)
+
+    if debug:
+        st.sidebar.write("Address input:", address_input)
+        st.sidebar.write("Geocode result:", lat, lon, full_address)
+
     if lat:
         st.info(f"📍 **Analyzing:** {full_address}")
         
@@ -83,8 +131,13 @@ if address_input:
         # Fetch 1 full year of data for calculations
         # Using 2023 as a baseline for "Typical Year"
         with st.spinner("Calculating solar yields..."):
-            data = fetch_archive_data(lat, lon, "2023-01-01", "2023-12-31")
-        
+            data, status_code, resp_snip = fetch_archive_data(lat, lon, "2023-01-01", "2023-12-31")
+
+        if debug:
+            st.sidebar.write("Archive fetch status:", status_code)
+            if resp_snip:
+                st.sidebar.write("Archive response snippet:", resp_snip)
+
         if data:
             df = pd.DataFrame({
                 "Timestamp": pd.to_datetime(data['hourly']['time']),
@@ -198,14 +251,14 @@ if address_input:
                 ### Self-Assessment Guide
                 1. **Units (kWh):** This is the measure of electricity used by your home. One 'unit' on your bill is 1 kWh.
                 2. **System Efficiency:** We assume a **78% Efficiency**. This accounts for heat in Indian summers, dust on panels, and the conversion from DC to AC.
-                3. **Calculation:**
+                3. **Calculation:"
                    - We pull historical satellite data for your specific Latitude/Longitude.
-                   - We multiply the sun's intensity (GHI) by your system siz                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       e.
+                   - We multiply the sun's intensity (GHI) by your system siz
                    - We subtract losses for a realistic estimate.
                 
                 **Note:** This is a remote assessment. A physical site visit is required to check for roof shadows and structural integrity.
                 """)
     else:
-        st.error("Address not found. Please try adding city and state.")
+        st.error("Address not found. Please try adding city and state or enable manual lat/lon.")
 else:
     st.info("Enter your address in the sidebar to start your solar assessment.")
