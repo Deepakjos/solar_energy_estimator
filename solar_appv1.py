@@ -25,12 +25,17 @@ st.markdown("""
         border: 1px solid #e0e0e0;
         height: 110px;
     }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] { padding: 8px 16px; }
+    .address-header {
+        background-color: #e1f5fe;
+        padding: 15px;
+        border-radius: 10px;
+        border-left: 5px solid #0288d1;
+        margin-bottom: 20px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-# --- LOGIC ---
+# --- CACHED DATA FETCHING ---
 @st.cache_data(show_spinner=False)
 def fetch_solar_data(lat, lon, start_date, end_date):
     url = "https://archive-api.open-meteo.com/v1/archive"
@@ -62,22 +67,29 @@ st.sidebar.header("🔌 System Capacity")
 sys_capacity = st.sidebar.slider("Proposed System Size (kW)", 1.0, 50.0, 5.0)
 sys_efficiency = st.sidebar.slider("System Efficiency (%)", 50, 95, 78) / 100
 
+# --- MAIN PAGE LOGIC ---
+st.title("☀️ Solar Rooftop Self-Assessment")
+
 if address_input:
-    geolocator = Nominatim(user_agent="solar_planner_v1")
+    # Get coordinates and the official formatted address
+    geolocator = Nominatim(user_agent="solar_planner_v1_deployment")
     location = geolocator.geocode(address_input, timeout=10)
     
     if location:
         lat, lon = location.latitude, location.longitude
+        full_address = location.address # This is the "actual map address"
         
-        # 1. Fetch Baseline (2024 full year) for Financials
+        # DISPLAY ADDRESS FOR ALL TABS
+        st.markdown(f"""
+            <div class="address-header">
+                <strong>📍 Selected Location:</strong><br>{full_address}
+            </div>
+        """, unsafe_allow_html=True)
+        
+        # Fetch Datasets
+        # 1. Baseline for Financials (Full year 2024)
         baseline_df = fetch_solar_data(lat, lon, "2024-01-01", "2024-12-31")
         
-        # 2. Fetch Recent (Last 14 days to ensure 1 week of overlap)
-        today = datetime.now()
-        start_recent = (today - timedelta(days=14)).strftime('%Y-%m-%d')
-        end_recent = (today - timedelta(days=2)).strftime('%Y-%m-%d') # Archive has ~2 day delay
-        recent_df = fetch_solar_data(lat, lon, start_recent, end_recent)
-
         tab_summary, tab_monthly, tab_hourly, tab_area = st.tabs([
             "💰 Financials", "📅 Monthly", "📈 Hourly Detail", "📏 Area"
         ])
@@ -94,39 +106,43 @@ if address_input:
                 c1.metric("Est. Monthly Gen.", f"{mon_yield:.0f} kWh")
                 c2.metric("Annual Savings", f"₹{ann_savings:,.0f}")
                 c3.metric("Bill Offset", f"{(mon_yield / (monthly_bill/electricity_rate) * 100):.1f}%")
+                
+                st.info("💡 Calculations based on 2024 historical solar irradiance data.")
 
         # --- MONTHLY ---
         with tab_monthly:
             if not baseline_df.empty:
                 baseline_df['Month'] = baseline_df['Timestamp'].dt.strftime('%b')
                 m_df = baseline_df.groupby(baseline_df['Timestamp'].dt.month).agg({'prod':'sum', 'Month':'first'}).sort_index()
-                st.plotly_chart(px.bar(m_df, x='Month', y='prod', color_discrete_sequence=['#FFD700']), use_container_width=True)
+                fig = px.bar(m_df, x='Month', y='prod', labels={'prod': 'Generation (kWh)'}, color_discrete_sequence=['#FFD700'])
+                st.plotly_chart(fig, use_container_width=True)
 
-        # --- HOURLY (REVISED) ---
+        # --- HOURLY ---
         with tab_hourly:
-            st.subheader("Recent Production Analysis")
             # Default to 7 days ago
             default_date = datetime.now().date() - timedelta(days=7)
+            selected_date = st.date_input("Select Date", value=default_date)
             
-            selected_date = st.date_input("Pick a Date", value=default_date)
-            
-            # Fetch specific day if not in the recent cache
+            # Fetch specific day
             day_df = fetch_solar_data(lat, lon, selected_date.strftime('%Y-%m-%d'), selected_date.strftime('%Y-%m-%d'))
             
             if not day_df.empty:
                 day_df['prod'] = (day_df['ghi'] / 1000) * sys_capacity * sys_efficiency
-                fig = px.area(day_df, x='Timestamp', y='prod', title=f"Output for {selected_date}", color_discrete_sequence=['#FF8C00'])
+                fig = px.area(day_df, x='Timestamp', y='prod', title=f"Hourly Output: {selected_date}", color_discrete_sequence=['#FF8C00'])
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.warning("Data for this date is not yet available in the meteorological archive (usually 2-5 days delay).")
+                st.warning("Meteorological data for this date is not yet archived. Please select a date at least 3-5 days in the past.")
 
         # --- AREA ---
         with tab_area:
+            st.write("Draw on your roof to estimate space.")
             m = folium.Map(location=[lat, lon], zoom_start=19)
-            folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 
-                             attr='Esri', name='Satellite').add_to(m)
+            folium.TileLayer(
+                tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 
+                attr='Esri', name='Satellite'
+            ).add_to(m)
             Draw(export=False).add_to(m)
             st_folium(m, width=700, height=450)
 
     else:
-        st.error("Location not found.")
+        st.error("Location not found. Please try a more specific address or coordinates.")
