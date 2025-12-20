@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from geopy.geocoders import Nominatim
 import plotly.express as px
 import folium
@@ -13,46 +13,52 @@ from shapely.geometry import shape
 # --- APP CONFIGURATION ---
 st.set_page_config(page_title="Solar Rooftop Planner", page_icon="☀️", layout="wide")
 
-# --- STYLING ---
+# --- STYLING (Revised for Metric Font Size) ---
 st.markdown("""
     <style>
     .main { background-color: #f0f2f6; }
-    .stMetric { background-color: #ffffff; padding: 20px; border-radius: 12px; border: 1px solid #e0e0e0; }
+    /* Target the metric value and label to fit the box */
+    [data-testid="stMetricValue"] {
+        font-size: 1.8rem !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.9rem !important;
+        white-space: normal !important;
+    }
+    .stMetric { 
+        background-color: #ffffff; 
+        padding: 15px; 
+        border-radius: 12px; 
+        border: 1px solid #e0e0e0;
+        height: 120px;
+    }
     div[data-testid="stExpander"] { background-color: white; border-radius: 10px; }
     .stButton>button { width: 100%; border-radius: 8px; height: 3em; background-color: #FF4B4B; color: white; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- REFACTORED LOGIC ---
-
+# --- CACHED LOGIC ---
 @st.cache_data(show_spinner=False)
 def get_coordinates(address):
     try:
-        # Added a more unique user agent to avoid rate limiting on Cloud
         geolocator = Nominatim(user_agent="solar_planner_v1_deployment")
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude, location.address) if location else (None, None, None)
-    except Exception as e:
-        st.error(f"Geocoding Error: {e}")
+    except:
         return None, None, None
 
 @st.cache_data(show_spinner=False)
 def fetch_archive_data(lat, lon, start_date, end_date):
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": start_date,
-        "end_date": end_date,
-        "hourly": "shortwave_radiation",
-        "timezone": "auto"
+        "latitude": lat, "longitude": lon,
+        "start_date": start_date, "end_date": end_date,
+        "hourly": "shortwave_radiation", "timezone": "auto"
     }
     try:
         res = requests.get(url, params=params, timeout=15)
-        res.raise_for_status() # Raise error for 4xx/5xx responses
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Weather Data Error: {e}")
+        return res.json() if res.status_code == 200 else None
+    except:
         return None
 
 def calculate_geodesic_area(geojson_geometry):
@@ -80,14 +86,12 @@ if address_input:
     if lat:
         st.info(f"📍 **Analyzing:** {full_address}")
         
-        # Tabs
         tab_summary, tab_monthly, tab_hourly, tab_area, tab_guide = st.tabs([
-            "💰 Financial & Impact", "📅 Monthly Averages", 
-            "📈 Hourly Detail", "📏 Rooftop Area", "📖 Guide"
+            "💰 Financial & Impact", "📅 Monthly Averages", "📈 Hourly Detail", "📏 Rooftop Area", "📖 Guide"
         ])
 
-        with st.spinner("Fetching 2023 Solar Irradiance data..."):
-            # Ensure the year is fully finalized in the archive
+        with st.spinner("Analyzing solar potential..."):
+            # Fetch full year 2023 data for calculations
             data = fetch_archive_data(lat, lon, "2023-01-01", "2023-12-31")
         
         if data and 'hourly' in data:
@@ -95,9 +99,6 @@ if address_input:
                 "Timestamp": pd.to_datetime(data['hourly']['time']),
                 "ghi": data['hourly']['shortwave_radiation']
             })
-            
-            # Clean data (handle NaNs if any)
-            df['ghi'] = df['ghi'].fillna(0)
             df['production'] = (df['ghi'] / 1000) * sys_capacity * sys_efficiency
             
             # --- TAB 1: FINANCIAL ---
@@ -108,57 +109,62 @@ if address_input:
                 bill_offset = (monthly_yield / (monthly_bill/electricity_rate) * 100)
                 
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Est. Monthly Generation", f"{monthly_yield:.0f} Units")
-                c2.metric("Annual Bill Savings", f"₹{annual_savings:,.0f}")
+                # CSS ensures labels and values fit inside these boxes
+                c1.metric("Est. Monthly Gen.", f"{monthly_yield:.0f} kWh")
+                c2.metric("Annual Savings", f"₹{annual_savings:,.0f}")
                 c3.metric("Bill Offset", f"{bill_offset:.1f}%")
 
-                st.divider()
                 st.subheader("🌍 Environmental Impact")
                 co2_saved = (annual_yield * 0.7) / 1000 
                 e1, e2 = st.columns(2)
                 e1.metric("CO2 Saved", f"{co2_saved:.2f} Tonnes/Yr")
-                e2.metric("Tree Equivalent", f"{int(co2_saved * 45)} Trees")
+                e2.metric("Trees Equivalent", f"{int(co2_saved * 45)} Trees")
 
             # --- TAB 2: MONTHLY ---
             with tab_monthly:
-                df['Month'] = df['Timestamp'].dt.strftime('%b')
-                monthly_df = df.groupby(df['Timestamp'].dt.month).agg({
-                    'production': 'sum', 'Month': 'first'
-                }).sort_index()
-                
-                fig_monthly = px.bar(monthly_df, x='Month', y='production', 
-                                    title="Energy Yield by Month",
-                                    color_discrete_sequence=['#FFD700'])
+                df['MonthName'] = df['Timestamp'].dt.strftime('%b')
+                monthly_df = df.groupby(df['Timestamp'].dt.month).agg({'production': 'sum', 'MonthName': 'first'}).sort_index()
+                fig_monthly = px.bar(monthly_df, x='MonthName', y='production', color_discrete_sequence=['#FFD700'])
                 st.plotly_chart(fig_monthly, use_container_width=True)
 
-            # --- TAB 3: HOURLY ---
+            # --- TAB 3: HOURLY DETAIL (Fixes) ---
             with tab_hourly:
-                date_range = st.date_input("Filter Data Range", [datetime(2023, 4, 1), datetime(2023, 4, 7)])
+                st.subheader("Historical Hourly Production")
+                # Default to 1st Jan of the year
+                default_start = datetime(2023, 1, 1)
+                default_end = datetime(2023, 1, 1)
+                
+                date_range = st.date_input(
+                    "Select Date (Note: Data is historical for 2023)", 
+                    [default_start, default_end],
+                    min_value=datetime(2023, 1, 1),
+                    max_value=datetime(2023, 12, 31)
+                )
+
                 if len(date_range) == 2:
                     mask = (df['Timestamp'].dt.date >= date_range[0]) & (df['Timestamp'].dt.date <= date_range[1])
-                    fig_hourly = px.area(df.loc[mask], x='Timestamp', y='production', 
-                                        color_discrete_sequence=['#FF8C00'])
-                    st.plotly_chart(fig_hourly, use_container_width=True)
+                    filtered_df = df.loc[mask]
+                    
+                    if not filtered_df.empty:
+                        fig_hourly = px.area(filtered_df, x='Timestamp', y='production', color_discrete_sequence=['#FF8C00'])
+                        st.plotly_chart(fig_hourly, use_container_width=True)
+                    else:
+                        st.warning("No data found for the selected range in the 2023 dataset.")
 
-            # --- TAB 4: AREA ---
+            # --- TAB 4 & 5 (Existing Logic) ---
             with tab_area:
                 m = folium.Map(location=[lat, lon], zoom_start=19)
-                folium.TileLayer(
-                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri', name='Satellite'
-                ).add_to(m)
-                Draw(export=False, position='topleft').add_to(m)
-                
-                output = st_folium(m, width=700, height=500)
-                if output.get('all_drawings'):
-                    geom = output['all_drawings'][-1]['geometry']
+                folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 
+                                 attr='Esri', name='Satellite').add_to(m)
+                Draw(export=False).add_to(m)
+                out = st_folium(m, width=700, height=500)
+                if out.get('all_drawings'):
+                    geom = out['all_drawings'][-1]['geometry']
                     if geom['type'] == 'Polygon':
-                        area_m2 = calculate_geodesic_area(geom)
-                        st.success(f"Area: {area_m2:.1f} m² | Est. Capacity: {area_m2/10:.1f} kW")
-
+                        a = calculate_geodesic_area(geom)
+                        st.success(f"Area: {a:.1f} m² | Potential: {a/10:.1f} kW")
+            
             with tab_guide:
-                st.markdown("### How it Works\n1. Uses historical GHI data.\n2. 78% efficiency assumed.")
+                st.write("Using 2023 historical GHI data as a baseline for calculations.")
         else:
-            st.warning("⚠️ No solar data could be retrieved for this location. The API might be restricted or the year range is invalid.")
-    else:
-        st.error("Address not found. Please be more specific (e.g., add City, State).")
+            st.error("Could not fetch solar data. Please check connection or address.")
